@@ -1,0 +1,280 @@
+name: 构建系统镜像（从源码仓库）
+
+# 手动触发：一次构建一个或多个发行版的 rootfs.img
+#   产物：rootfs-<distro>-<kernelver>.7z + .sha256（COMPRESS_IMAGE=0 时为 .img）
+#   发布：统一汇总到 tag latest 的 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: '目标发行版'
+        required: true
+        type: choice
+        default: both
+        options: [both, arch, fedora]
+      kernel_version:
+        description: '内核版本（对应 kernel-deb 的 release tag kernel-v<版本>）'
+        required: true
+        type: string
+        default: '7.3'
+      image_size:
+        description: '镜像大小（可选，如 8G / 10G；留空用发行版默认值）'
+        required: false
+        type: string
+        default: ''
+      compress:
+        description: '压缩为 .7z（关闭则上传裸 rootfs.img，体积大）'
+        required: true
+        type: boolean
+        default: true
+      source_repo:
+        description: '源码仓库（owner/name）'
+        required: false
+        default: 'Winter21c/arch-raphael'
+        type: string
+      source_ref:
+        description: '源码分支或标签'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 把 distro 输入展开成 matrix
+  # ---------------------------------------------------------------------------
+  matrix:
+    name: 生成构建矩阵
+    runs-on: ubuntu-24.04
+    outputs:
+      distros: ${{ steps.gen.outputs.distros }}
+      kernel_version: ${{ steps.gen.outputs.kernel_version }}
+      compress: ${{ steps.gen.outputs.compress }}
+    steps:
+      - name: 解析输入
+        id: gen
+        run: |
+          set -euo pipefail
+          case "${{ inputs.distro }}" in
+            both)   DISTROS='["arch","fedora"]' ;;
+            arch)   DISTROS='["arch"]' ;;
+            fedora) DISTROS='["fedora"]' ;;
+            *)      echo "未知 distro: ${{ inputs.distro }}" >&2; exit 1 ;;
+          esac
+          echo "distros=$DISTROS" >> "$GITHUB_OUTPUT"
+          echo "kernel_version=${{ inputs.kernel_version }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.compress }}" = "true" ]; then
+            echo "compress=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "compress=0" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2. 并行构建（arm64 runner 原生执行 aarch64 命令，无需 qemu）
+  #    ubuntu-24.04-arm 不可用时改用 ubuntu-24.04 + docker/qemu，见文件末尾说明
+  # ---------------------------------------------------------------------------
+  build:
+    name: 构建 ${{ matrix.distro }} · 内核 ${{ needs.matrix.outputs.kernel_version }}
+    needs: matrix
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ${{ fromJson(needs.matrix.outputs.distros) }}
+    env:
+      DISTRO: ${{ matrix.distro }}
+      KERNEL_VERSION: ${{ needs.matrix.outputs.kernel_version }}
+      IMAGE_SIZE: ${{ inputs.image_size }}
+      COMPRESS_IMAGE: ${{ needs.matrix.outputs.compress }}
+      ARTIFACT_BASE: rootfs-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}
+      BUILD_LOG: build-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}.log
+    steps:
+      - name: 检出源码仓库（Winter21c/arch-raphael）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.source_repo || 'Winter21c/arch-raphael' }}
+          ref: ${{ github.event.inputs.source_ref || 'main' }}
+
+      - name: 环境信息
+        run: |
+          set -x
+          uname -srm
+          nproc
+          df -h /
+          free -h || true
+
+      - name: 安装主机依赖
+        run: |
+          set -euo pipefail
+          bash tools/host-prep.sh --check || true
+          sudo bash tools/host-prep.sh --yes
+          sudo modprobe loop 2>/dev/null || true
+          sudo losetup -D 2>/dev/null || true
+
+      - name: 静态自检
+        run: bash tools/verify.sh
+
+      - name: 构建镜像
+        run: |
+          set -euo pipefail
+          chmod +x build.sh tools/*.sh
+          ENVVARS=("KERNEL_VERSION=$KERNEL_VERSION" "COMPRESS_IMAGE=$COMPRESS_IMAGE")
+          if [ -n "${{ inputs.image_size }}" ]; then
+            ENVVARS+=("IMAGE_SIZE=$IMAGE_SIZE")
+          fi
+          echo "==> KERNEL_VERSION=$KERNEL_VERSION COMPRESS_IMAGE=$COMPRESS_IMAGE IMAGE_SIZE=${IMAGE_SIZE:-默认}"
+          # 不加 --inner：由 build.sh 自行决定原生执行还是进入容器
+          #   arch   -> arm64 runner 原生（ALARM tarball + chroot pacman）
+          #   fedora -> 主机没有 dnf5，自动 docker run fedora:44
+          echo "==> sudo ./build.sh $DISTRO"
+          sudo env "${ENVVARS[@]}" ./build.sh "$DISTRO" 2>&1 | tee "$BUILD_LOG"
+
+      - name: 整理产物与校验和
+        id: artifacts
+        run: |
+          set -euo pipefail
+          ls -lh ./*.7z ./*.img ./*.sha256 2>/dev/null || true
+
+          PAYLOAD=""
+          if [ -f "$ARTIFACT_BASE.7z" ]; then
+            PAYLOAD="$ARTIFACT_BASE.7z"
+            rm -f rootfs.img
+          elif [ -f "$ARTIFACT_BASE.img" ]; then
+            PAYLOAD="$ARTIFACT_BASE.img"
+          elif [ -f rootfs.img ]; then
+            mv rootfs.img "$ARTIFACT_BASE.img"
+            PAYLOAD="$ARTIFACT_BASE.img"
+          fi
+          [ -n "$PAYLOAD" ] || { echo "[错误] 未找到构建产物（期望 $ARTIFACT_BASE.7z 或 .img）" >&2; exit 1; }
+
+          sha256sum "$PAYLOAD" > "$PAYLOAD.sha256"
+          cat "$PAYLOAD.sha256"
+          echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
+          echo "sha_file=$PAYLOAD.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_BASE }}
+          path: |
+            ${{ steps.artifacts.outputs.payload }}
+            ${{ steps.artifacts.outputs.sha_file }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ env.ARTIFACT_BASE }}
+          path: |
+            ${{ env.BUILD_LOG }}
+            work/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 清理 loop 设备与挂载点
+        if: always()
+        run: |
+          set +e
+          sudo umount -R work/rootdir 2>/dev/null
+          sudo losetup -D 2>/dev/null
+          sudo losetup -a 2>/dev/null
+          df -h /
+          exit 0
+
+  # ---------------------------------------------------------------------------
+  # 3. 汇总所有产物 → Release（tag: latest）
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布 latest
+    needs: [matrix, build]
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载所有构建产物
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: rootfs-*
+          merge-multiple: true
+
+      - name: 生成 Release 说明
+        id: body
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t FILES < <(ls -1 artifacts/*.7z artifacts/*.img 2>/dev/null || true)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "没有可用产物，跳过 Release"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Redmi K20 Pro (raphael) 系统镜像"
+            echo ""
+            echo "> 内核 ${{ needs.matrix.outputs.kernel_version }} · 自动构建于 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "| 文件 | 大小 | SHA256 |"
+            echo "|------|------|--------|"
+            for f in "${FILES[@]}"; do
+              name=$(basename "$f")
+              size=$(du -h "$f" | cut -f1)
+              sha="见 .sha256 文件"
+              if [ -f "$f.sha256" ]; then sha=$(awk '{print $1}' "$f.sha256"); fi
+              echo "| $name | $size | $sha |"
+            done
+            echo ""
+            echo "### 刷写步骤"
+            echo ""
+            echo "1. 7z x <文件>.7z            # 解压得到 rootfs.img"
+            echo "2. sha256sum -c <文件>.7z.sha256   # 校验 .7z"
+            echo "3. fastboot flash userdata rootfs.img"
+            echo ""
+            echo "首次启动账号 user / 1234（请立即修改）；USB 网络 SSH: ssh user@172.16.42.1"
+          } > release-body.md
+          cat release-body.md
+
+      - name: "发布到 Release (tag: latest)"
+        if: steps.body.outputs.skip == '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Redmi K20 Pro 系统镜像 (latest)"
+          body_path: release-body.md
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/*.7z
+            artifacts/*.7z.sha256
+            artifacts/*.img
+            artifacts/*.img.sha256
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 备选：没有 ubuntu-24.04-arm 时改用 x86_64 runner（docker + binfmt）
+#
+#   1) 把 build 任务的 runs-on 改成 ubuntu-24.04
+#   2) 在“安装主机依赖”步骤后追加：
+#        - name: 注册 qemu binfmt（x86_64 交叉执行 aarch64）
+#          run: |
+#            sudo bash tools/host-prep.sh --yes --with-cross
+#            ls /proc/sys/fs/binfmt_misc/qemu-aarch64
+#   3) 构建步骤保持 sudo env ... ./build.sh <distro> --inner：
+#      binfmt 注册后 chroot 进 arm64 根文件系统即可直接执行；build.sh 用到的
+#      parted/losetup/btrfs 仍是主机（x86_64）程序，与架构无关。
+#   4) 若不想装 binfmt，也可以去掉 --inner 与 sudo，让 build.sh 自己进容器：
+#        ./build.sh <distro>
+#      该路径需要 docker + --privileged（容器镜像由 config/distro.conf 的
+#      CONTAINER_IMAGE 决定：arch → debian:trixie-slim，fedora → fedora:44）。
+# ─────────────────────────────────────────────────────────────────────────────
