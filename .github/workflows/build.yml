@@ -433,7 +433,11 @@ jobs:
             echo "fastboot reboot"
             echo '```'
             echo ""
-            echo "> 设备需已解锁并刷入支持该引导链的 U-Boot，完整说明见源码仓库"
+            echo "# 3) 若 Release 里带 boot-*.img（ABL 直接引导，推荐）"
+            echo "fastboot flash boot boot-<distro>-<kver>.img"
+            echo "fastboot flash userdata rootfs.img"
+            echo ""
+            echo "> 设备需已解锁；boot.img 方式不需要 U-Boot。完整说明见源码仓库"
             echo "> [docs/INSTALL.md](https://github.com/Winter21c/arch-raphael/blob/main/docs/INSTALL.md)。"
             echo ""
             echo "首次启动请立即修改默认密码。"
