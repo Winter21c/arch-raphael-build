@@ -28,6 +28,21 @@ on:
         required: true
         type: boolean
         default: true
+      root_password:
+        description: 'root 密码（默认 1234）'
+        required: false
+        default: '1234'
+        type: string
+      user_name:
+        description: '普通用户名（默认 user）'
+        required: false
+        default: 'user'
+        type: string
+      user_password:
+        description: '普通用户密码（默认 1234）'
+        required: false
+        default: '1234'
+        type: string
       source_repo:
         description: '源码仓库（owner/name）'
         required: false
@@ -96,6 +111,9 @@ jobs:
       COMPRESS_IMAGE: ${{ needs.matrix.outputs.compress }}
       ARTIFACT_BASE: rootfs-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}
       BUILD_LOG: build-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}.log
+      ROOT_PASS: ${ inputs.root_password || '1234' }}
+      USER_NAME: ${ inputs.user_name || 'user' }}
+      USER_PASS: ${ inputs.user_password || '1234' }}
     steps:
       - name: 检出源码仓库（Winter21c/arch-raphael）
         uses: actions/checkout@v4
@@ -126,14 +144,16 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x build.sh tools/*.sh
-          ENVVARS=("KERNEL_VERSION=$KERNEL_VERSION" "COMPRESS_IMAGE=$COMPRESS_IMAGE")
+          # 凭据在日志里打码（镜像内仍写入用户输入的值）
+          echo "::add-mask::$ROOT_PASS"
+          echo "::add-mask::$USER_PASS"
+          ENVVARS=("KERNEL_VERSION=$KERNEL_VERSION" "COMPRESS_IMAGE=$COMPRESS_IMAGE"
+                   "ROOT_PASS=$ROOT_PASS" "USER_NAME=$USER_NAME" "USER_PASS=$USER_PASS")
           if [ -n "${{ inputs.image_size }}" ]; then
             ENVVARS+=("IMAGE_SIZE=$IMAGE_SIZE")
           fi
           echo "==> KERNEL_VERSION=$KERNEL_VERSION COMPRESS_IMAGE=$COMPRESS_IMAGE IMAGE_SIZE=${IMAGE_SIZE:-默认}"
-          # 不加 --inner：由 build.sh 自行决定原生执行还是进入容器
-          #   arch   -> arm64 runner 原生（ALARM tarball + chroot pacman）
-          #   fedora -> 主机没有 dnf5，自动 docker run fedora:44
+          echo "==> 账号: $USER_NAME / *** ，root / ***"
           echo "==> sudo ./build.sh $DISTRO"
           sudo env "${ENVVARS[@]}" ./build.sh "$DISTRO" 2>&1 | tee "$BUILD_LOG"
 
@@ -198,7 +218,7 @@ jobs:
   release:
     name: 发布 latest
     needs: [matrix, build]
-    if: always() && needs.build.result != 'cancelled'
+    if: needs.build.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: 下载所有构建产物
