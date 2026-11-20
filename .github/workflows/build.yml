@@ -75,9 +75,7 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: false
+# 并发：不限制（Arch 与 Fedora 可同时构建）
 
 jobs:
   # ---------------------------------------------------------------------------
