@@ -2,7 +2,15 @@ name: 构建系统镜像（从源码仓库）
 
 # 手动触发：一次构建一个或多个发行版的 rootfs.img
 #   产物：rootfs-<distro>-<kernelver>.7z + .sha256（COMPRESS_IMAGE=0 时为 .img）
-#   发布：统一汇总到 tag latest 的 Release
+#   发布：统一汇总到 tag latest 的 Release（含发行版/内核/用户名/特性/刷写命令/逐产物 sha256）
+#
+# 输入 → 环境变量映射（config/device.conf 中同名变量可被环境覆盖）：
+#   root_password → ROOT_PASS        user_name → USER_NAME         user_password → USER_PASS
+#   hostname      → HOSTNAME_DEFAULT install_ime → INSTALL_IME     kernel_version → KERNEL_VERSION
+#   凭据只在 build 的 job 级 env 定义一次，因此 distro=both 时 arch / fedora 两条矩阵腿
+#   拿到的是完全相同的账号、主机名与输入法设置。
+#
+# 约定：run: 脚本里一律不写 GitHub 表达式，输入只经 env 进入 shell（避免注入与转义问题）。
 
 on:
   workflow_dispatch:
@@ -29,30 +37,40 @@ on:
         type: boolean
         default: true
       root_password:
-        description: 'root 密码（默认 1234）'
+        description: '构建进镜像的 root 登录密码；不要填你 GitHub 的密码'
         required: false
-        default: '1234'
         type: string
+        default: '1234'
       user_name:
-        description: '普通用户名（默认 user）'
+        description: '构建进镜像的普通用户名（默认 user；小写字母/数字/_/-）'
         required: false
+        type: string
         default: 'user'
-        type: string
       user_password:
-        description: '普通用户密码（默认 1234）'
+        description: '构建进镜像的普通用户登录密码；不要填你 GitHub 的密码'
         required: false
-        default: '1234'
         type: string
+        default: '1234'
+      hostname:
+        description: '镜像内主机名（写入 /etc/hostname，默认 raphael）'
+        required: false
+        type: string
+        default: 'raphael'
+      install_ime:
+        description: '安装中文输入法 fcitx5（对应 INSTALL_IME=1）'
+        required: true
+        type: boolean
+        default: true
       source_repo:
         description: '源码仓库（owner/name）'
         required: false
-        default: 'Winter21c/arch-raphael'
         type: string
+        default: 'Winter21c/arch-raphael'
       source_ref:
         description: '源码分支或标签'
         required: false
-        default: 'main'
         type: string
+        default: 'main'
 
 permissions:
   contents: write
@@ -63,33 +81,78 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. 把 distro 输入展开成 matrix
+  # 1. 校验输入 → 展开成 matrix（同时归一化 hostname / install_ime）
+  #    放在便宜的 ubuntu-24.04 上做，避免输入写错后浪费 arm64 构建分钟数
   # ---------------------------------------------------------------------------
   matrix:
-    name: 生成构建矩阵
+    name: 校验输入并生成构建矩阵
     runs-on: ubuntu-24.04
     outputs:
       distros: ${{ steps.gen.outputs.distros }}
       kernel_version: ${{ steps.gen.outputs.kernel_version }}
       compress: ${{ steps.gen.outputs.compress }}
+      hostname: ${{ steps.gen.outputs.hostname }}
+      install_ime: ${{ steps.gen.outputs.install_ime }}
     steps:
       - name: 解析输入
         id: gen
+        env:
+          IN_DISTRO: ${{ inputs.distro }}
+          IN_KERNEL: ${{ inputs.kernel_version }}
+          IN_COMPRESS: ${{ inputs.compress }}
+          IN_ROOT_PASS: ${{ inputs.root_password }}
+          IN_USER_NAME: ${{ inputs.user_name }}
+          IN_USER_PASS: ${{ inputs.user_password }}
+          IN_HOSTNAME: ${{ inputs.hostname }}
+          IN_INSTALL_IME: ${{ inputs.install_ime }}
         run: |
           set -euo pipefail
-          case "${{ inputs.distro }}" in
+          echo "::add-mask::$IN_ROOT_PASS"
+          echo "::add-mask::$IN_USER_PASS"
+
+          case "$IN_DISTRO" in
             both)   DISTROS='["arch","fedora"]' ;;
             arch)   DISTROS='["arch"]' ;;
             fedora) DISTROS='["fedora"]' ;;
-            *)      echo "未知 distro: ${{ inputs.distro }}" >&2; exit 1 ;;
+            *)      echo "[错误] 未知 distro: $IN_DISTRO" >&2; exit 1 ;;
           esac
-          echo "distros=$DISTROS" >> "$GITHUB_OUTPUT"
-          echo "kernel_version=${{ inputs.kernel_version }}" >> "$GITHUB_OUTPUT"
-          if [ "${{ inputs.compress }}" = "true" ]; then
-            echo "compress=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "compress=0" >> "$GITHUB_OUTPUT"
-          fi
+
+          printf '%s' "$IN_KERNEL" | grep -Eq '^[0-9A-Za-z][0-9A-Za-z._-]*$' \
+            || { echo "[错误] kernel_version 只能包含字母/数字/._-: $IN_KERNEL" >&2; exit 1; }
+
+          # 用户名会写进镜像的 /etc/passwd，先在入口挡住非法值
+          printf '%s' "$IN_USER_NAME" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' \
+            || { echo "[错误] user_name 需匹配 ^[a-z_][a-z0-9_-]*$（小写字母开头，可含数字/_/-）: $IN_USER_NAME" >&2; exit 1; }
+
+          HOSTNAME="${IN_HOSTNAME:-raphael}"
+          printf '%s' "$HOSTNAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]*$' \
+            || { echo "[错误] hostname 需匹配 ^[A-Za-z0-9][A-Za-z0-9-]*$: $HOSTNAME" >&2; exit 1; }
+
+          for v in "$IN_ROOT_PASS" "$IN_USER_PASS"; do
+            [ -n "$v" ] || { echo "[错误] 密码不能为空" >&2; exit 1; }
+            case "$v" in
+              *$'\n'*) echo "[错误] 密码不能包含换行" >&2; exit 1 ;;
+            esac
+          done
+
+          # boolean 输入在 run 里渲染成 true/false，统一成 build.sh 认识的 0/1
+          case "$(printf '%s' "$IN_INSTALL_IME" | tr '[:upper:]' '[:lower:]')" in
+            false|0|no|off)   INSTALL_IME=0 ;;
+            true|1|yes|on|'') INSTALL_IME=1 ;;
+            *) echo "[错误] install_ime 无法识别: $IN_INSTALL_IME" >&2; exit 1 ;;
+          esac
+
+          if [ "$IN_COMPRESS" = "true" ]; then COMPRESS=1; else COMPRESS=0; fi
+
+          {
+            echo "distros=$DISTROS"
+            echo "kernel_version=$IN_KERNEL"
+            echo "compress=$COMPRESS"
+            echo "hostname=$HOSTNAME"
+            echo "install_ime=$INSTALL_IME"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "==> 发行版: $DISTROS | 内核: $IN_KERNEL | 压缩: $COMPRESS | 主机名: $HOSTNAME | INSTALL_IME=$INSTALL_IME"
 
   # ---------------------------------------------------------------------------
   # 2. 并行构建（arm64 runner 原生执行 aarch64 命令，无需 qemu）
@@ -107,19 +170,22 @@ jobs:
     env:
       DISTRO: ${{ matrix.distro }}
       KERNEL_VERSION: ${{ needs.matrix.outputs.kernel_version }}
-      IMAGE_SIZE: ${{ inputs.image_size }}
+      IMAGE_SIZE_INPUT: ${{ inputs.image_size }}
       COMPRESS_IMAGE: ${{ needs.matrix.outputs.compress }}
+      HOSTNAME_DEFAULT: ${{ needs.matrix.outputs.hostname }}
+      INSTALL_IME: ${{ needs.matrix.outputs.install_ime }}
       ARTIFACT_BASE: rootfs-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}
       BUILD_LOG: build-${{ matrix.distro }}-${{ needs.matrix.outputs.kernel_version }}.log
-      ROOT_PASS: ${ inputs.root_password || '1234' }}
-      USER_NAME: ${ inputs.user_name || 'user' }}
-      USER_PASS: ${ inputs.user_password || '1234' }}
+      # 凭据唯一来源：下面三个变量直接取自 inputs，所有矩阵腿共享同一组值
+      ROOT_PASS: ${{ inputs.root_password || '1234' }}
+      USER_NAME: ${{ inputs.user_name || 'user' }}
+      USER_PASS: ${{ inputs.user_password || '1234' }}
     steps:
-      - name: 检出源码仓库（Winter21c/arch-raphael）
+      - name: 检出源码仓库
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.source_repo || 'Winter21c/arch-raphael' }}
-          ref: ${{ github.event.inputs.source_ref || 'main' }}
+          repository: ${{ inputs.source_repo || 'Winter21c/arch-raphael' }}
+          ref: ${{ inputs.source_ref || 'main' }}
 
       - name: 环境信息
         run: |
@@ -128,6 +194,20 @@ jobs:
           nproc
           df -h /
           free -h || true
+
+      - name: 核对凭据与构建参数
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$ROOT_PASS"
+          echo "::add-mask::$USER_PASS"
+          # 只打印用户名与密码长度，不打印明文；distro=both 时两条腿的这组值应完全一致
+          printf '==> 发行版        : %s\n' "$DISTRO"
+          printf '==> 内核版本      : %s\n' "$KERNEL_VERSION"
+          printf '==> 普通用户      : %s（密码长度 %s）\n' "$USER_NAME" "${#USER_PASS}"
+          printf '==> root 密码长度 : %s\n' "${#ROOT_PASS}"
+          printf '==> 主机名        : %s\n' "$HOSTNAME_DEFAULT"
+          printf '==> 输入法        : INSTALL_IME=%s\n' "$INSTALL_IME"
+          printf '==> 压缩          : COMPRESS_IMAGE=%s\n' "$COMPRESS_IMAGE"
 
       - name: 安装主机依赖
         run: |
@@ -148,11 +228,13 @@ jobs:
           echo "::add-mask::$ROOT_PASS"
           echo "::add-mask::$USER_PASS"
           ENVVARS=("KERNEL_VERSION=$KERNEL_VERSION" "COMPRESS_IMAGE=$COMPRESS_IMAGE"
+                   "HOSTNAME_DEFAULT=$HOSTNAME_DEFAULT" "INSTALL_IME=$INSTALL_IME"
                    "ROOT_PASS=$ROOT_PASS" "USER_NAME=$USER_NAME" "USER_PASS=$USER_PASS")
-          if [ -n "${{ inputs.image_size }}" ]; then
-            ENVVARS+=("IMAGE_SIZE=$IMAGE_SIZE")
+          if [ -n "$IMAGE_SIZE_INPUT" ]; then
+            ENVVARS+=("IMAGE_SIZE=$IMAGE_SIZE_INPUT")
           fi
-          echo "==> KERNEL_VERSION=$KERNEL_VERSION COMPRESS_IMAGE=$COMPRESS_IMAGE IMAGE_SIZE=${IMAGE_SIZE:-默认}"
+          echo "==> KERNEL_VERSION=$KERNEL_VERSION COMPRESS_IMAGE=$COMPRESS_IMAGE IMAGE_SIZE=${IMAGE_SIZE_INPUT:-默认}"
+          echo "==> HOSTNAME_DEFAULT=$HOSTNAME_DEFAULT INSTALL_IME=$INSTALL_IME"
           echo "==> 账号: $USER_NAME / *** ，root / ***"
           echo "==> sudo ./build.sh $DISTRO"
           sudo env "${ENVVARS[@]}" ./build.sh "$DISTRO" 2>&1 | tee "$BUILD_LOG"
@@ -176,9 +258,27 @@ jobs:
           [ -n "$PAYLOAD" ] || { echo "[错误] 未找到构建产物（期望 $ARTIFACT_BASE.7z 或 .img）" >&2; exit 1; }
 
           sha256sum "$PAYLOAD" > "$PAYLOAD.sha256"
+          sha256sum -c "$PAYLOAD.sha256"
           cat "$PAYLOAD.sha256"
           echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
           echo "sha_file=$PAYLOAD.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: 校验压缩包完整性（7z t）
+        if: endsWith(steps.artifacts.outputs.payload, '.7z')
+        env:
+          PAYLOAD: ${{ steps.artifacts.outputs.payload }}
+        run: |
+          set -euo pipefail
+          SEVENZ="$(command -v 7z || command -v 7zz || command -v 7za || true)"
+          if [ -z "$SEVENZ" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip
+            SEVENZ="$(command -v 7z || command -v 7zz || command -v 7za)"
+          fi
+          echo "==> $SEVENZ t $PAYLOAD"
+          # 校验失败即让本 job 失败，避免把损坏的包发到 Release
+          "$SEVENZ" t "$PAYLOAD"
+          echo "==> 压缩包完整性校验通过"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -231,10 +331,16 @@ jobs:
 
       - name: 生成 Release 说明
         id: body
+        env:
+          KERNEL_VERSION: ${{ needs.matrix.outputs.kernel_version }}
+          HOSTNAME: ${{ needs.matrix.outputs.hostname }}
+          INSTALL_IME: ${{ needs.matrix.outputs.install_ime }}
+          DISTRO_SCOPE: ${{ inputs.distro }}
+          USER_NAME: ${{ inputs.user_name || 'user' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          mapfile -t FILES < <(ls -1 artifacts/*.7z artifacts/*.img 2>/dev/null || true)
+          mapfile -t FILES < <(ls -1 artifacts/*.7z artifacts/*.img 2>/dev/null | sort || true)
           if [ "${#FILES[@]}" -eq 0 ]; then
             echo "没有可用产物，跳过 Release"
             echo "skip=1" >> "$GITHUB_OUTPUT"
@@ -242,28 +348,87 @@ jobs:
           fi
           echo "skip=0" >> "$GITHUB_OUTPUT"
 
+          # 从文件名推断实际构建出的发行版清单
+          DISTRO_LIST=""
+          for f in "${FILES[@]}"; do
+            name=$(basename "$f")
+            d=${name#rootfs-}
+            d=${d%%-*}
+            case " $DISTRO_LIST " in
+              *" $d "*) ;;
+              *) DISTRO_LIST="${DISTRO_LIST:+$DISTRO_LIST, }$d" ;;
+            esac
+          done
+
           {
             echo "## Redmi K20 Pro (raphael) 系统镜像"
             echo ""
-            echo "> 内核 ${{ needs.matrix.outputs.kernel_version }} · 自动构建于 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+            echo "> 内核 ${KERNEL_VERSION} · 自动构建于 $(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| 发行版 | ${DISTRO_LIST}（触发输入: ${DISTRO_SCOPE}） |"
+            echo "| 内核版本 | ${KERNEL_VERSION} |"
+            echo "| 普通用户 | `${USER_NAME}` |"
+            echo "| root 用户 | `root` |"
+            echo "| 登录密码 | 按触发时输入（不在 Release 中公开） |"
+            echo "| 主机名 | `${HOSTNAME}` |"
+            if [ "${INSTALL_IME}" = "1" ]; then
+              echo "| 中文输入法 | 已安装（fcitx5, INSTALL_IME=1） |"
+            else
+              echo "| 中文输入法 | 未安装（INSTALL_IME=0） |"
+            fi
+            echo "| USB 网络 SSH | `ssh ${USER_NAME}@172.16.42.1` |"
+            echo ""
+            echo "### 镜像内部特性"
+            echo ""
+            echo "- 嵌套 GPT（4096 字节逻辑扇区）：p1 = ESP(FAT32) + p2 = **btrfs**"
+            echo "- btrfs 子卷 `@` / `@home`，挂载参数 `compress=zstd:3`；首次启动自动扩展到整块 `userdata`"
+            echo "- 桌面：**dux-shell (DMS)** + niri 合成器"
+            echo "- 登录界面：**dux-greeter** + greetd"
+            echo "- 虚拟键盘：**squeekboard**（登录界面与桌面均开箱可用）"
+            echo "- 默认**横屏**（`transform 90`）"
+            echo ""
+            echo "### 产物与 SHA256"
             echo ""
             echo "| 文件 | 大小 | SHA256 |"
             echo "|------|------|--------|"
             for f in "${FILES[@]}"; do
               name=$(basename "$f")
               size=$(du -h "$f" | cut -f1)
-              sha="见 .sha256 文件"
-              if [ -f "$f.sha256" ]; then sha=$(awk '{print $1}' "$f.sha256"); fi
-              echo "| $name | $size | $sha |"
+              actual=$(sha256sum "$f" | awk '{print $1}')
+              if [ -f "$f.sha256" ]; then
+                expect=$(awk '{print $1}' "$f.sha256")
+                if [ "$actual" != "$expect" ]; then
+                  echo "[错误] ${name} 校验和与 ${name}.sha256 不一致" >&2
+                  exit 1
+                fi
+              fi
+              echo "| ${name} | ${size} | `${actual}` |"
             done
             echo ""
-            echo "### 刷写步骤"
+            echo "### 刷写命令"
             echo ""
-            echo "1. 7z x <文件>.7z            # 解压得到 rootfs.img"
-            echo "2. sha256sum -c <文件>.7z.sha256   # 校验 .7z"
-            echo "3. fastboot flash userdata rootfs.img"
+            echo '```bash'
+            echo "# 1) 校验并解压（一次只刷一个发行版，解压后镜像名均为 rootfs.img）"
+            for f in "${FILES[@]}"; do
+              name=$(basename "$f")
+              echo "sha256sum -c ${name}.sha256"
+              case "$name" in
+                *.7z)  echo "7z x ${name}" ;;
+                *.img) echo "# ${name} 已是裸镜像，无需解压" ;;
+              esac
+            done
             echo ""
-            echo "首次启动账号 user / 1234（请立即修改）；USB 网络 SSH: ssh user@172.16.42.1"
+            echo "# 2) 刷入 userdata 分区并重启"
+            echo "fastboot flash userdata rootfs.img"
+            echo "fastboot reboot"
+            echo '```'
+            echo ""
+            echo "> 设备需已解锁并刷入支持该引导链的 U-Boot，完整说明见源码仓库"
+            echo "> [docs/INSTALL.md](https://github.com/Winter21c/arch-raphael/blob/main/docs/INSTALL.md)。"
+            echo ""
+            echo "首次启动请立即修改默认密码。"
           } > release-body.md
           cat release-body.md
 
@@ -297,4 +462,8 @@ jobs:
 #        ./build.sh <distro>
 #      该路径需要 docker + --privileged（容器镜像由 config/distro.conf 的
 #      CONTAINER_IMAGE 决定：arch → debian:trixie-slim，fedora → fedora:44）。
+#      注意：走容器时 build.sh 只透传 docker_env 白名单里的变量，
+#      HOSTNAME_DEFAULT 目前不在白名单内（容器内会退回默认值 raphael），
+#      INSTALL_IME 在白名单内可正常生效。根治需在源码仓库 build.sh 的
+#      docker_env 循环里补上 HOSTNAME_DEFAULT。
 # ─────────────────────────────────────────────────────────────────────────────
