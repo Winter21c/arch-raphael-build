@@ -263,6 +263,13 @@ jobs:
           cat "$PAYLOAD.sha256"
           echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
           echo "sha_file=$PAYLOAD.sha256" >> "$GITHUB_OUTPUT"
+          BOOT_IMG="$(ls boot-*.img 2>/dev/null | head -1 || true)"
+          if [ -n "$BOOT_IMG" ]; then
+            rm -f "$BOOT_IMG.sha256"
+            sha256sum "$BOOT_IMG" > "$BOOT_IMG.sha256"
+            echo "boot_payload=$BOOT_IMG" >> "$GITHUB_OUTPUT"
+            echo "boot_sha=$BOOT_IMG.sha256" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 校验压缩包完整性（7z t）
         if: endsWith(steps.artifacts.outputs.payload, '.7z')
@@ -288,6 +295,8 @@ jobs:
           path: |
             ${{ steps.artifacts.outputs.payload }}
             ${{ steps.artifacts.outputs.sha_file }}
+            ${{ steps.artifacts.outputs.boot_payload }}
+            ${{ steps.artifacts.outputs.boot_sha }}
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
