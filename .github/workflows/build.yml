@@ -257,6 +257,7 @@ jobs:
           fi
           [ -n "$PAYLOAD" ] || { echo "[错误] 未找到构建产物（期望 $ARTIFACT_BASE.7z 或 .img）" >&2; exit 1; }
 
+          rm -f "$PAYLOAD.sha256"
           sha256sum "$PAYLOAD" > "$PAYLOAD.sha256"
           sha256sum -c "$PAYLOAD.sha256"
           cat "$PAYLOAD.sha256"
