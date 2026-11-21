@@ -261,6 +261,15 @@ jobs:
           cat "$PAYLOAD.sha256"
           echo "payload=$PAYLOAD" >> "$GITHUB_OUTPUT"
           echo "sha_file=$PAYLOAD.sha256" >> "$GITHUB_OUTPUT"
+          # U-Boot 引导链产物：cache 分区镜像（systemd-boot + 内核 + initramfs + dtb）
+          CACHE_IMG="$(ls cache-*.img 2>/dev/null | head -1 || true)"
+          if [ -n "$CACHE_IMG" ]; then
+            rm -f "$CACHE_IMG.sha256"
+            sha256sum "$CACHE_IMG" > "$CACHE_IMG.sha256"
+            echo "cache_payload=$CACHE_IMG" >> "$GITHUB_OUTPUT"
+            echo "cache_sha=$CACHE_IMG.sha256" >> "$GITHUB_OUTPUT"
+          fi
+
           BOOT_IMG="$(ls boot-*.img 2>/dev/null | head -1 || true)"
           if [ -n "$BOOT_IMG" ]; then
             rm -f "$BOOT_IMG.sha256"
@@ -295,6 +304,8 @@ jobs:
             ${{ steps.artifacts.outputs.sha_file }}
             ${{ steps.artifacts.outputs.boot_payload }}
             ${{ steps.artifacts.outputs.boot_sha }}
+            ${{ steps.artifacts.outputs.cache_payload }}
+            ${{ steps.artifacts.outputs.cache_sha }}
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
