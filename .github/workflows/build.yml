@@ -401,12 +401,12 @@ jobs:
             echo ""
             echo "### 镜像内部特性"
             echo ""
-            echo "- 嵌套 GPT（4096 字节逻辑扇区）：p1 = ESP(FAT32) + p2 = **btrfs**"
+            echo "- **扁平 btrfs**：整块 userdata 直接是 btrfs（无嵌套 GPT），`@` / `@home` 子卷"
             echo "- btrfs 子卷 `@` / `@home`，挂载参数 `compress=zstd:3`；首次启动自动扩展到整块 `userdata`"
             echo "- 桌面：**dux-shell (DMS)** + niri 合成器"
             echo "- 登录界面：**dux-greeter** + greetd"
             echo "- 虚拟键盘：**squeekboard**（登录界面与桌面均开箱可用）"
-            echo "- 默认**横屏**（`transform 90`）"
+            echo "- 默认**横屏**（`transform 270`）"
             echo ""
             echo "### 产物与 SHA256"
             echo ""
@@ -439,7 +439,10 @@ jobs:
               esac
             done
             echo ""
-            echo "# 2) 刷入 userdata 分区并重启"
+            echo "# 2) U-Boot 引导链：擦 dtbo + 刷 boot(U-Boot) + cache(引导分区) + userdata(rootfs)"
+            echo "fastboot erase dtbo"
+            echo "fastboot flash boot u-boot.img"
+            echo "fastboot flash cache cache-<distro>-<kver>.img"
             echo "fastboot flash userdata rootfs.img"
             echo "fastboot reboot"
             echo '```'
