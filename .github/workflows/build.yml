@@ -25,7 +25,7 @@ on:
         description: '内核版本（对应 kernel-deb 的 release tag kernel-v<版本>）'
         required: true
         type: string
-        default: '7.3'
+        default: '7.2'
       image_size:
         description: '镜像大小（可选，如 8G / 10G；留空用发行版默认值）'
         required: false
